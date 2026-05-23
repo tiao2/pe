@@ -27,10 +27,8 @@ jobs:
             -DLEVELDB_BUILD_SNAPPY=OFF \
             -DLEVELDB_BUILD_ZSTD=OFF
           emmake make -j$(nproc)
-          # 创建系统目录以便 emcc 自动查找（头文件）
           mkdir -p $EMSDK/upstream/emscripten/cache/sysroot/include/leveldb
           cp -r ../include/leveldb/* $EMSDK/upstream/emscripten/cache/sysroot/include/leveldb/
-          # 关键修复：复制到 wasm32-emscripten 子目录，这是 emcc 默认库搜索路径
           mkdir -p $EMSDK/upstream/emscripten/cache/sysroot/lib/wasm32-emscripten
           cp libleveldb.a $EMSDK/upstream/emscripten/cache/sysroot/lib/wasm32-emscripten/
 
@@ -39,11 +37,32 @@ jobs:
           cd phy_engine_src
           mkdir -p build_wasm
           cd build_wasm
-          # 创建模拟包装器
-          printf '#include <string>\n#include <cstring>\n\nextern "C" const char* simulate_verilog(const char* code) {\n    static std::string result = "Simulated: ";\n    result += code;\n    return result.c_str();\n}\n' > sim_wrapper.cpp
-          SRC_FILES=$(find ../src -name "*.cpp" ! -path "*/fuzz/*" ! -path "*/benchmark/*" ! -path "*/test/*")
-          if [ -z "$SRC_FILES" ]; then echo "No source files found"; exit 1; fi
-          # 链接 leveldb 静态库
+          # 创建包装函数（不含 main）
+          cat > sim_wrapper.cpp << 'EOF'
+          #include <string>
+          #include <cstring>
+          extern "C" const char* simulate_verilog(const char* code) {
+              static std::string result = "Simulated: ";
+              result += code;
+              return result.c_str();
+          }
+          EOF
+          # 排除所有包含 main 函数的源文件以及测试/辅助目录
+          SRC_FILES=$(find ../src -name "*.cpp" \
+            ! -path "*/fuzz/*" \
+            ! -path "*/benchmark/*" \
+            ! -path "*/test/*" \
+            ! -name "dll_main.cpp" \
+            ! -name "verilog2plsav.cpp" \
+            ! -name "verilog2penl.cpp" \
+            ! -name "x86_16_multi_module_export_plsav.cpp" \
+            ! -name "x86_16_multi_module_plsav_trace.cpp" \
+            ! -name "x86_16_multi_module.cpp")
+          if [ -z "$SRC_FILES" ]; then
+            echo "No source files found"
+            exit 1
+          fi
+          echo "Compiling source files: $SRC_FILES"
           emcc -std=c++20 -O2 $SRC_FILES sim_wrapper.cpp -I../include \
             -lleveldb \
             -s WASM=1 -s EXPORTED_FUNCTIONS='["_simulate_verilog","_malloc","_free"]' \
