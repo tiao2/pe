@@ -1,0 +1,1055 @@
+﻿#pragma once
+
+// Adapter: PhysicsLab .sav (PL) ↔ Phy-Engine (PE) simulation via the C ABI (`dll_api.h`).
+// This file is optional: it requires linking with the implementation of `create_circuit()/analyze_circuit()/...`
+// (provided by `src/dll_main.cpp` in this repo, or the built shared library).
+
+#include "physicslab.h"
+
+#include <phy_engine/phy_engine.h>
+#include <phy_engine/dll_api.h>
+#include <phy_engine/netlist/operation.h>
+
+#include <cerrno>
+#include <cmath>
+#include <cstddef>
+#include <cstdint>
+#include <cstdlib>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+
+namespace phy_engine::phy_lab_wrapper::pe
+{
+using json = nlohmann::json;
+
+struct endpoint
+{
+    std::size_t element_index{};
+    int pin{};
+};
+
+struct sample
+{
+    std::vector<double> pin_voltage;
+    std::vector<std::size_t> pin_voltage_ord;  // comp_size+1
+
+    std::vector<double> branch_current;
+    std::vector<std::size_t> branch_current_ord;  // comp_size+1
+
+    std::vector<std::uint8_t> pin_digital;  // binary (0/1) or 4-state (0=L,1=H,2=X,3=Z), depending on sampler
+    std::vector<std::size_t> pin_digital_ord;  // comp_size+1
+};
+
+struct write_back_options
+{
+    // PhysicsLab Logic Output stores a numeric "状态" property.
+    // Default preserves historical behavior: X/Z are treated as high when writing back.
+    double logic_output_low{0.0};
+    double logic_output_high{1.0};
+    double logic_output_x{1.0};
+    double logic_output_z{1.0};
+};
+
+namespace detail
+{
+inline status err(std::errc ec, std::string msg) noexcept
+{
+    ::phy_engine::phy_lab_wrapper::detail::set_last_error(msg);
+    return {ec, std::move(msg)};
+}
+
+inline status_or<double> parse_double_ec(std::string_view s) noexcept
+{
+    if(s.empty())
+    {
+        return err(std::errc::invalid_argument, "invalid numeric string: ");
+    }
+
+    std::string tmp(s);
+    char* end{};
+    errno = 0;
+    double v = std::strtod(tmp.c_str(), &end);
+    if(end != tmp.c_str() + tmp.size() || errno == ERANGE || !std::isfinite(v))
+    {
+        return err(std::errc::invalid_argument, "invalid numeric string: " + tmp);
+    }
+    return v;
+}
+
+inline status_or<double> to_double_ec(json const& v) noexcept
+{
+    if (v.is_number_float() || v.is_number_integer() || v.is_number_unsigned())
+    {
+        return v.get<double>();  // guarded by type checks
+    }
+    if (v.is_boolean())
+    {
+        return v.get<bool>() ? 1.0 : 0.0;  // guarded by type checks
+    }
+    if (v.is_string())
+    {
+        auto const& s = v.get_ref<const std::string&>();
+        auto r = parse_double_ec(s);
+        if(!r) { return r.st; }
+        return *r.value;
+    }
+    return err(std::errc::invalid_argument, "value is not numeric");
+}
+
+inline status_or<double> get_required_float_ec(json const& element_data, std::string_view key) noexcept
+{
+    auto it_props = element_data.find("Properties");
+    if (it_props == element_data.end() || !it_props->is_object())
+    {
+        return err(std::errc::invalid_argument, "element missing Properties");
+    }
+    auto it = it_props->find(std::string(key));
+    if (it == it_props->end())
+    {
+        return err(std::errc::invalid_argument, "element missing property: " + std::string(key));
+    }
+    auto r = to_double_ec(*it);
+    if(!r) { return r.st; }
+    return *r.value;
+}
+
+inline status validate_write_back_options_ec(write_back_options const& opt) noexcept
+{
+    if(!std::isfinite(opt.logic_output_low) || !std::isfinite(opt.logic_output_high) || !std::isfinite(opt.logic_output_x) || !std::isfinite(opt.logic_output_z))
+    {
+        return err(std::errc::invalid_argument, "write_back_options values must be finite");
+    }
+    return {};
+}
+
+inline double map_logic_output_state(std::uint8_t state, write_back_options const& opt) noexcept
+{
+    switch(state)
+    {
+        case PHY_ENGINE_D_L: return opt.logic_output_low;
+        case PHY_ENGINE_D_H: return opt.logic_output_high;
+        case PHY_ENGINE_D_X: return opt.logic_output_x;
+        case PHY_ENGINE_D_Z: return opt.logic_output_z;
+        default: return opt.logic_output_x;
+    }
+}
+
+inline status_or<int> get_required_int01_ec(json const& element_data, std::string_view key) noexcept
+{
+    auto v = get_required_float_ec(element_data, key);
+    if(!v) { return v.st; }
+    return (*v.value != 0.0) ? 1 : 0;
+}
+
+struct code_and_props
+{
+    int code{};
+    std::vector<double> props{};
+};
+
+inline status_or<code_and_props> to_phy_engine_code_and_props_ec(json const& element_data) noexcept
+{
+    auto model_id = element_data.value("ModelID", "");
+    if (model_id.empty())
+    {
+        return err(std::errc::invalid_argument, "element missing ModelID");
+    }
+
+    // Ground is represented as code 0 (special-cased by the wiring algorithm).
+    if (model_id == "Ground Component")
+    {
+        return code_and_props{0, {}};
+    }
+
+    // Linear / passive
+    if (model_id == "Resistor")
+    {
+        auto v = get_required_float_ec(element_data, "电阻");
+        if(!v) { return v.st; }
+        return code_and_props{PHY_ENGINE_E_RESISTOR, { *v.value }};
+    }
+    if (model_id == "Basic Capacitor")
+    {
+        auto v = get_required_float_ec(element_data, "电容");
+        if(!v) { return v.st; }
+        return code_and_props{PHY_ENGINE_E_CAPACITOR, { *v.value }};
+    }
+    if (model_id == "Basic Inductor")
+    {
+        auto v = get_required_float_ec(element_data, "电感");
+        if(!v) { return v.st; }
+        return code_and_props{PHY_ENGINE_E_INDUCTOR, { *v.value }};
+    }
+    if (model_id == "Battery Source")
+    {
+        auto v = get_required_float_ec(element_data, "电压");
+        if(!v) { return v.st; }
+        return code_and_props{PHY_ENGINE_E_VDC, { *v.value }};
+    }
+
+    // Controller
+    if (model_id == "Simple Switch" || model_id == "Push Switch" || model_id == "Air Switch")
+    {
+        auto st = get_required_int01_ec(element_data, "开关");
+        if(!st) { return st.st; }
+        return code_and_props{PHY_ENGINE_E_SWITCH_SPST, { static_cast<double>(*st.value) }};
+    }
+
+    // Coupled devices
+    if (model_id == "Transformer")
+    {
+        auto vp = get_required_float_ec(element_data, "输入电压");
+        if(!vp) { return vp.st; }
+        auto vs = get_required_float_ec(element_data, "输出电压");
+        if(!vs) { return vs.st; }
+        if (*vs.value == 0.0)
+        {
+            return err(std::errc::invalid_argument, "Transformer 输出电压 must be non-zero");
+        }
+        return code_and_props{PHY_ENGINE_E_TRANSFORMER, { *vp.value / *vs.value }};  // n = Vp/Vs
+    }
+    if (model_id == "Mutual Inductor")
+    {
+        auto l1 = get_required_float_ec(element_data, "电感1");
+        if(!l1) { return l1.st; }
+        auto l2 = get_required_float_ec(element_data, "电感2");
+        if(!l2) { return l2.st; }
+        auto k = get_required_float_ec(element_data, "耦合系数");
+        if(!k) { return k.st; }
+        return code_and_props{PHY_ENGINE_E_COUPLED_INDUCTORS, { *l1.value, *l2.value, *k.value }};
+    }
+
+    // Non-linear convenience blocks
+    if (model_id == "Rectifier")
+    {
+        return code_and_props{PHY_ENGINE_E_FULL_BRIDGE_RECTIFIER, {}};
+    }
+
+    // Digital (logic circuit)
+    if (model_id == "Logic Input")
+    {
+        auto state = get_required_int01_ec(element_data, "开关");
+        if(!state) { return state.st; }
+        return code_and_props{PHY_ENGINE_E_DIGITAL_INPUT, { static_cast<double>(*state.value) }};
+    }
+    if (model_id == "Logic Output") return code_and_props{PHY_ENGINE_E_DIGITAL_OUTPUT, {}};
+    if (model_id == "Or Gate") return code_and_props{PHY_ENGINE_E_DIGITAL_OR, {}};
+    if (model_id == "Yes Gate") return code_and_props{PHY_ENGINE_E_DIGITAL_YES, {}};
+    if (model_id == "And Gate") return code_and_props{PHY_ENGINE_E_DIGITAL_AND, {}};
+    if (model_id == "No Gate") return code_and_props{PHY_ENGINE_E_DIGITAL_NOT, {}};
+    if (model_id == "Xor Gate") return code_and_props{PHY_ENGINE_E_DIGITAL_XOR, {}};
+    if (model_id == "Xnor Gate") return code_and_props{PHY_ENGINE_E_DIGITAL_XNOR, {}};
+    if (model_id == "Nand Gate") return code_and_props{PHY_ENGINE_E_DIGITAL_NAND, {}};
+    if (model_id == "Nor Gate") return code_and_props{PHY_ENGINE_E_DIGITAL_NOR, {}};
+    if (model_id == "Imp Gate") return code_and_props{PHY_ENGINE_E_DIGITAL_IMP, {}};
+    if (model_id == "Nimp Gate") return code_and_props{PHY_ENGINE_E_DIGITAL_NIMP, {}};
+
+    if (model_id == "Half Adder") return code_and_props{PHY_ENGINE_E_DIGITAL_HALF_ADDER, {}};
+    if (model_id == "Full Adder") return code_and_props{PHY_ENGINE_E_DIGITAL_FULL_ADDER, {}};
+    if (model_id == "Half Subtractor") return code_and_props{PHY_ENGINE_E_DIGITAL_HALF_SUBTRACTOR, {}};
+    if (model_id == "Full Subtractor") return code_and_props{PHY_ENGINE_E_DIGITAL_FULL_SUBTRACTOR, {}};
+    if (model_id == "Multiplier") return code_and_props{PHY_ENGINE_E_DIGITAL_MUL2, {}};
+
+    if (model_id == "D Flipflop") return code_and_props{PHY_ENGINE_E_DIGITAL_DFF, {}};
+    if (model_id == "T Flipflop") return code_and_props{PHY_ENGINE_E_DIGITAL_TFF, {}};
+    if (model_id == "Real-T Flipflop") return code_and_props{PHY_ENGINE_E_DIGITAL_T_BAR_FF, {}};
+    if (model_id == "JK Flipflop") return code_and_props{PHY_ENGINE_E_DIGITAL_JKFF, {}};
+
+    // Higher-level modules are expanded by the adapter (see `circuit::build_`).
+    if (model_id == "Counter" || model_id == "Random Generator" || model_id == "8bit Input" || model_id == "8bit Display")
+    {
+        return err(std::errc::invalid_argument, "internal: high-level module should be expanded by adapter: " + model_id);
+    }
+
+    return err(std::errc::invalid_argument, "Phy-Engine backend does not support element ModelID=" + model_id);
+}
+
+inline status_or<std::size_t> expected_prop_arity_ec(int element_code) noexcept
+{
+    switch (element_code)
+    {
+        case 0: return 0;
+        case PHY_ENGINE_E_RESISTOR: return 1;
+        case PHY_ENGINE_E_CAPACITOR: return 1;
+        case PHY_ENGINE_E_INDUCTOR: return 1;
+        case PHY_ENGINE_E_VDC: return 1;
+        case PHY_ENGINE_E_SWITCH_SPST: return 1;
+        case PHY_ENGINE_E_TRANSFORMER: return 1;
+        case PHY_ENGINE_E_COUPLED_INDUCTORS: return 3;
+        case PHY_ENGINE_E_FULL_BRIDGE_RECTIFIER: return 0;
+        case PHY_ENGINE_E_DIGITAL_INPUT: return 1;
+
+        case PHY_ENGINE_E_DIGITAL_OUTPUT: return 0;
+        case PHY_ENGINE_E_DIGITAL_OR: return 0;
+        case PHY_ENGINE_E_DIGITAL_YES: return 0;
+        case PHY_ENGINE_E_DIGITAL_AND: return 0;
+        case PHY_ENGINE_E_DIGITAL_NOT: return 0;
+        case PHY_ENGINE_E_DIGITAL_XOR: return 0;
+        case PHY_ENGINE_E_DIGITAL_XNOR: return 0;
+        case PHY_ENGINE_E_DIGITAL_NAND: return 0;
+        case PHY_ENGINE_E_DIGITAL_NOR: return 0;
+        case PHY_ENGINE_E_DIGITAL_IMP: return 0;
+        case PHY_ENGINE_E_DIGITAL_NIMP: return 0;
+
+        case PHY_ENGINE_E_DIGITAL_HALF_ADDER: return 0;
+        case PHY_ENGINE_E_DIGITAL_FULL_ADDER: return 0;
+        case PHY_ENGINE_E_DIGITAL_HALF_SUBTRACTOR: return 0;
+        case PHY_ENGINE_E_DIGITAL_FULL_SUBTRACTOR: return 0;
+        case PHY_ENGINE_E_DIGITAL_MUL2: return 0;
+        case PHY_ENGINE_E_DIGITAL_DFF: return 0;
+        case PHY_ENGINE_E_DIGITAL_TFF: return 0;
+        case PHY_ENGINE_E_DIGITAL_T_BAR_FF: return 0;
+        case PHY_ENGINE_E_DIGITAL_JKFF: return 0;
+        case PHY_ENGINE_E_DIGITAL_COUNTER4: return 1;
+        case PHY_ENGINE_E_DIGITAL_RANDOM_GENERATOR4: return 1;
+        default: return err(std::errc::invalid_argument, "unknown property arity for PE element code: " + std::to_string(element_code));
+    }
+}
+
+inline void ensure_object(json& j, char const* key)
+{
+    auto it = j.find(key);
+    if (it == j.end() || !it->is_object())
+    {
+        j[key] = json::object();
+    }
+}
+}  // namespace detail
+
+class circuit
+{
+public:
+    static status_or<circuit> build_from_ec(experiment const& ex) noexcept
+    {
+        ::phy_engine::phy_lab_wrapper::detail::clear_last_error();
+        if (ex.type() != experiment_type::circuit)
+        {
+            return detail::err(std::errc::invalid_argument, "pe::circuit only supports circuit experiments");
+        }
+
+        circuit out;
+        auto st = out.build_(ex);
+        if(!st) { return st; }
+        return out;
+    }
+
+    circuit() = default;
+    circuit(circuit&& other) noexcept { *this = std::move(other); }
+    circuit& operator=(circuit&& other) noexcept
+    {
+        if (this == &other) return *this;
+        close();
+        circuit_ptr_ = other.circuit_ptr_;
+        vec_pos_ = other.vec_pos_;
+        chunk_pos_ = other.chunk_pos_;
+        comp_size_ = other.comp_size_;
+        comp_element_ids_ = std::move(other.comp_element_ids_);
+        comp_codes_ = std::move(other.comp_codes_);
+        other.circuit_ptr_ = nullptr;
+        other.vec_pos_ = nullptr;
+        other.chunk_pos_ = nullptr;
+        other.comp_size_ = 0;
+        return *this;
+    }
+
+    circuit(circuit const&) = delete;
+    circuit& operator=(circuit const&) = delete;
+
+    ~circuit() { close(); }
+
+    void close() noexcept
+    {
+        if (circuit_ptr_ != nullptr)
+        {
+            destroy_circuit(circuit_ptr_, vec_pos_, chunk_pos_);
+            circuit_ptr_ = nullptr;
+            vec_pos_ = nullptr;
+            chunk_pos_ = nullptr;
+            comp_size_ = 0;
+        }
+    }
+
+    [[nodiscard]] std::size_t comp_size() const noexcept { return comp_size_; }
+
+    [[nodiscard]] status set_analyze_type_ec(phy_engine_analyze_type type) noexcept
+    {
+        ::phy_engine::phy_lab_wrapper::detail::clear_last_error();
+        if (circuit_ptr_ == nullptr) { return detail::err(std::errc::invalid_argument, "circuit is closed"); }
+        if (circuit_set_analyze_type(circuit_ptr_, static_cast<std::uint32_t>(type)) != 0)
+        {
+            return detail::err(std::errc::io_error, "circuit_set_analyze_type failed");
+        }
+        return {};
+    }
+
+    [[nodiscard]] status set_tr_ec(double t_step, double t_stop) noexcept
+    {
+        ::phy_engine::phy_lab_wrapper::detail::clear_last_error();
+        if (circuit_ptr_ == nullptr) { return detail::err(std::errc::invalid_argument, "circuit is closed"); }
+        if (circuit_set_tr(circuit_ptr_, t_step, t_stop) != 0)
+        {
+            return detail::err(std::errc::io_error, "circuit_set_tr failed");
+        }
+        return {};
+    }
+
+    [[nodiscard]] status set_ac_omega_ec(double omega) noexcept
+    {
+        ::phy_engine::phy_lab_wrapper::detail::clear_last_error();
+        if (circuit_ptr_ == nullptr) { return detail::err(std::errc::invalid_argument, "circuit is closed"); }
+        if (circuit_set_ac_omega(circuit_ptr_, omega) != 0)
+        {
+            return detail::err(std::errc::io_error, "circuit_set_ac_omega failed");
+        }
+        return {};
+    }
+
+    [[nodiscard]] status analyze_ec() noexcept
+    {
+        ::phy_engine::phy_lab_wrapper::detail::clear_last_error();
+        if (circuit_ptr_ == nullptr) { return detail::err(std::errc::invalid_argument, "circuit is closed"); }
+        if (circuit_analyze(circuit_ptr_) != 0)
+        {
+            return detail::err(std::errc::io_error, "circuit_analyze failed");
+        }
+        return {};
+    }
+
+    [[nodiscard]] status digital_clk_ec() noexcept
+    {
+        ::phy_engine::phy_lab_wrapper::detail::clear_last_error();
+        if (circuit_ptr_ == nullptr) { return detail::err(std::errc::invalid_argument, "circuit is closed"); }
+        if (circuit_digital_clk(circuit_ptr_) != 0)
+        {
+            return detail::err(std::errc::io_error, "circuit_digital_clk failed");
+        }
+        return {};
+    }
+
+    [[nodiscard]] status_or<sample> sample_now_ec() const noexcept
+    {
+        ::phy_engine::phy_lab_wrapper::detail::clear_last_error();
+        if (circuit_ptr_ == nullptr) { return detail::err(std::errc::invalid_argument, "circuit is closed"); }
+
+        sample s;
+        s.pin_voltage_ord.assign(comp_size_ + 1, 0);
+        s.branch_current_ord.assign(comp_size_ + 1, 0);
+        s.pin_digital_ord.assign(comp_size_ + 1, 0);
+
+        auto* c = static_cast<::phy_engine::circult*>(circuit_ptr_);
+        auto& nl = c->get_netlist();
+
+        std::size_t total_pins{};
+        std::size_t total_branches{};
+        for (std::size_t i{}; i < comp_size_; ++i)
+        {
+            auto* model = ::phy_engine::netlist::get_model(nl, ::phy_engine::netlist::model_pos{vec_pos_[i], chunk_pos_[i]});
+            if (model == nullptr || model->ptr == nullptr)
+            {
+                continue;
+            }
+            total_pins += model->ptr->generate_pin_view().size;
+            total_branches += model->ptr->generate_branch_view().size;
+        }
+
+        // The C ABI requires non-null pointers even when the logical size is 0.
+        s.pin_voltage.assign(total_pins == 0 ? 1 : total_pins, 0.0);
+        s.branch_current.assign(total_branches == 0 ? 1 : total_branches, 0.0);
+        s.pin_digital.assign(total_pins == 0 ? 1 : total_pins, 0);
+
+        if (circuit_sample_u8(circuit_ptr_,
+                              vec_pos_,
+                              chunk_pos_,
+                              comp_size_,
+                              s.pin_voltage.data(),
+                              s.pin_voltage_ord.data(),
+                              s.branch_current.data(),
+                              s.branch_current_ord.data(),
+                              s.pin_digital.data(),
+                              s.pin_digital_ord.data()) != 0)
+        {
+            return detail::err(std::errc::io_error, "circuit_sample_u8 failed");
+        }
+
+        s.pin_voltage.resize(s.pin_voltage_ord.back());
+        s.branch_current.resize(s.branch_current_ord.back());
+        s.pin_digital.resize(s.pin_digital_ord.back());
+        return s;
+    }
+
+    [[nodiscard]] status_or<sample> sample_now_digital_state_ec() const noexcept
+    {
+        ::phy_engine::phy_lab_wrapper::detail::clear_last_error();
+        if (circuit_ptr_ == nullptr) { return detail::err(std::errc::invalid_argument, "circuit is closed"); }
+
+        sample s;
+        s.pin_voltage_ord.assign(comp_size_ + 1, 0);
+        s.branch_current_ord.assign(comp_size_ + 1, 0);
+        s.pin_digital_ord.assign(comp_size_ + 1, 0);
+
+        auto* c = static_cast<::phy_engine::circult*>(circuit_ptr_);
+        auto& nl = c->get_netlist();
+
+        std::size_t total_pins{};
+        std::size_t total_branches{};
+        for (std::size_t i{}; i < comp_size_; ++i)
+        {
+            auto* model = ::phy_engine::netlist::get_model(nl, ::phy_engine::netlist::model_pos{vec_pos_[i], chunk_pos_[i]});
+            if (model == nullptr || model->ptr == nullptr)
+            {
+                continue;
+            }
+            total_pins += model->ptr->generate_pin_view().size;
+            total_branches += model->ptr->generate_branch_view().size;
+        }
+
+        s.pin_voltage.assign(total_pins == 0 ? 1 : total_pins, 0.0);
+        s.branch_current.assign(total_branches == 0 ? 1 : total_branches, 0.0);
+        s.pin_digital.assign(total_pins == 0 ? 1 : total_pins, 0);
+
+        if (circuit_sample_digital_state_u8(circuit_ptr_,
+                                            vec_pos_,
+                                            chunk_pos_,
+                                            comp_size_,
+                                            s.pin_voltage.data(),
+                                            s.pin_voltage_ord.data(),
+                                            s.branch_current.data(),
+                                            s.branch_current_ord.data(),
+                                            s.pin_digital.data(),
+                                            s.pin_digital_ord.data()) != 0)
+        {
+            return detail::err(std::errc::io_error, "circuit_sample_digital_state_u8 failed");
+        }
+
+        s.pin_voltage.resize(s.pin_voltage_ord.back());
+        s.branch_current.resize(s.branch_current_ord.back());
+        s.pin_digital.resize(s.pin_digital_ord.back());
+        return s;
+    }
+
+    [[nodiscard]] status sync_inputs_from_pl_ec(experiment const& ex) noexcept
+    {
+        ::phy_engine::phy_lab_wrapper::detail::clear_last_error();
+        if (circuit_ptr_ == nullptr) { return detail::err(std::errc::invalid_argument, "circuit is closed"); }
+        if (ex.type() != experiment_type::circuit) { return detail::err(std::errc::invalid_argument, "expected circuit experiment"); }
+
+        for (std::size_t i{}; i < comp_size_; ++i)
+        {
+            if (comp_codes_[i] != PHY_ENGINE_E_DIGITAL_INPUT)
+            {
+                continue;
+            }
+            if (comp_element_ids_[i].empty())
+            {
+                continue;
+            }
+
+            auto* el_ptr = ex.find_element(comp_element_ids_[i]);
+            if(el_ptr == nullptr)
+            {
+                return detail::err(std::errc::invalid_argument, "unknown element identifier: " + comp_element_ids_[i]);
+            }
+            auto const& el = el_ptr->data();
+            auto state01_r = detail::get_required_int01_ec(el, "开关");
+            if(!state01_r) { return state01_r.st; }
+            int state01 = (*state01_r.value != 0) ? 1 : 0;
+            if (circuit_set_model_digital(circuit_ptr_, vec_pos_[i], chunk_pos_[i], 0, static_cast<std::uint8_t>(state01)) != 0)
+            {
+                return detail::err(std::errc::io_error, "circuit_set_model_digital failed");
+            }
+        }
+        return {};
+    }
+
+    [[nodiscard]] status write_back_to_pl_ec(experiment& ex, sample const& s, write_back_options const& opt) const noexcept
+    {
+        ::phy_engine::phy_lab_wrapper::detail::clear_last_error();
+        if (ex.type() != experiment_type::circuit) { return detail::err(std::errc::invalid_argument, "expected circuit experiment"); }
+        if (s.pin_voltage_ord.size() != comp_size_ + 1 || s.branch_current_ord.size() != comp_size_ + 1 || s.pin_digital_ord.size() != comp_size_ + 1)
+        {
+            return detail::err(std::errc::invalid_argument, "invalid sample ord sizes");
+        }
+        auto opt_st = detail::validate_write_back_options_ec(opt);
+        if(!opt_st) { return opt_st; }
+
+        for (std::size_t i{}; i < comp_size_; ++i)
+        {
+            if (comp_element_ids_[i].empty())
+            {
+                continue;
+            }
+
+            auto* el_ptr = ex.find_element(comp_element_ids_[i]);
+            if(el_ptr == nullptr)
+            {
+                return detail::err(std::errc::invalid_argument, "unknown element identifier: " + comp_element_ids_[i]);
+            }
+            auto& el = el_ptr->data();
+            auto pins_n = s.pin_voltage_ord[i + 1] - s.pin_voltage_ord[i];
+            auto branches_n = s.branch_current_ord[i + 1] - s.branch_current_ord[i];
+
+            double v0 = (pins_n >= 1) ? s.pin_voltage[s.pin_voltage_ord[i] + 0] : 0.0;
+            double v1 = (pins_n >= 2) ? s.pin_voltage[s.pin_voltage_ord[i] + 1] : 0.0;
+            double dv = (pins_n >= 2) ? (v0 - v1) : v0;
+
+            double i0 = (branches_n >= 1) ? s.branch_current[s.branch_current_ord[i] + 0] : 0.0;
+
+            if (comp_codes_[i] == PHY_ENGINE_E_DIGITAL_OUTPUT)
+            {
+                auto d_n = s.pin_digital_ord[i + 1] - s.pin_digital_ord[i];
+                auto state = (d_n >= 1) ? s.pin_digital[s.pin_digital_ord[i] + 0] : static_cast<std::uint8_t>(PHY_ENGINE_D_L);
+                detail::ensure_object(el, "Properties");
+                el["Properties"]["状态"] = detail::map_logic_output_state(state, opt);
+                continue;
+            }
+
+            // Best-effort statistics update (many PL elements use these keys).
+            detail::ensure_object(el, "Statistics");
+            auto& st = el["Statistics"];
+            st["电压"] = dv;
+            st["电流"] = i0;
+            st["功率"] = dv * i0;
+        }
+        return {};
+    }
+
+    [[nodiscard]] status write_back_to_pl_ec(experiment& ex, sample const& s) const noexcept
+    {
+        return write_back_to_pl_ec(ex, s, write_back_options{});
+    }
+
+    [[nodiscard]] status write_back_now_to_pl_ec(experiment& ex, write_back_options const& opt) const noexcept
+    {
+        auto s = sample_now_digital_state_ec();
+        if(!s) { return s.st; }
+        return write_back_to_pl_ec(ex, *s.value, opt);
+    }
+
+    [[nodiscard]] status write_back_now_to_pl_ec(experiment& ex) const noexcept
+    {
+        return write_back_now_to_pl_ec(ex, write_back_options{});
+    }
+
+#if PHY_ENGINE_ENABLE_EXCEPTIONS
+    static circuit build_from(experiment const& ex)
+    {
+        auto r = build_from_ec(ex);
+        if(!r) { throw std::runtime_error(r.st.message); }
+        return std::move(*r.value);
+    }
+
+    void set_analyze_type(phy_engine_analyze_type type)
+    {
+        auto st = set_analyze_type_ec(type);
+        if(!st) { throw std::runtime_error(st.message); }
+    }
+
+    void set_tr(double t_step, double t_stop)
+    {
+        auto st = set_tr_ec(t_step, t_stop);
+        if(!st) { throw std::runtime_error(st.message); }
+    }
+
+    void set_ac_omega(double omega)
+    {
+        auto st = set_ac_omega_ec(omega);
+        if(!st) { throw std::runtime_error(st.message); }
+    }
+
+    void analyze()
+    {
+        auto st = analyze_ec();
+        if(!st) { throw std::runtime_error(st.message); }
+    }
+
+    void digital_clk()
+    {
+        auto st = digital_clk_ec();
+        if(!st) { throw std::runtime_error(st.message); }
+    }
+
+    sample sample_now() const
+    {
+        auto r = sample_now_ec();
+        if(!r) { throw std::runtime_error(r.st.message); }
+        return std::move(*r.value);
+    }
+
+    sample sample_now_digital_state() const
+    {
+        auto r = sample_now_digital_state_ec();
+        if(!r) { throw std::runtime_error(r.st.message); }
+        return std::move(*r.value);
+    }
+
+    void sync_inputs_from_pl(experiment const& ex)
+    {
+        auto st = sync_inputs_from_pl_ec(ex);
+        if(!st) { throw std::runtime_error(st.message); }
+    }
+
+    void write_back_to_pl(experiment& ex, sample const& s) const
+    {
+        auto st = write_back_to_pl_ec(ex, s);
+        if(!st) { throw std::runtime_error(st.message); }
+    }
+
+    void write_back_to_pl(experiment& ex, sample const& s, write_back_options const& opt) const
+    {
+        auto st = write_back_to_pl_ec(ex, s, opt);
+        if(!st) { throw std::runtime_error(st.message); }
+    }
+
+    void write_back_now_to_pl(experiment& ex) const
+    {
+        auto st = write_back_now_to_pl_ec(ex);
+        if(!st) { throw std::runtime_error(st.message); }
+    }
+
+    void write_back_now_to_pl(experiment& ex, write_back_options const& opt) const
+    {
+        auto st = write_back_now_to_pl_ec(ex, opt);
+        if(!st) { throw std::runtime_error(st.message); }
+    }
+#endif
+
+private:
+    status build_(experiment const& ex) noexcept
+    {
+        ::phy_engine::phy_lab_wrapper::detail::clear_last_error();
+        auto const& els = ex.elements();
+        if (els.empty())
+        {
+            return detail::err(std::errc::invalid_argument, "experiment has no elements");
+        }
+
+        std::unordered_map<std::string, std::size_t> pl_id_to_pl_index;
+        pl_id_to_pl_index.reserve(els.size());
+        for (std::size_t i{}; i < els.size(); ++i)
+        {
+            pl_id_to_pl_index.emplace(els[i].identifier(), i);
+        }
+
+        std::unordered_map<std::string, std::unordered_map<int, endpoint>> pin_map;
+        pin_map.reserve(els.size());
+
+        std::vector<int> element_codes;
+        std::vector<double> properties;
+        std::vector<std::string> comp_element_ids;
+        std::vector<int> comp_codes;
+
+        std::vector<int> internal_wires_flat;
+
+        auto add_pe_element = [&](int code, std::vector<double> props, std::string bind_id) -> status_or<std::size_t> {
+            std::size_t idx = element_codes.size();
+            element_codes.push_back(code);
+            if (code != 0)
+            {
+                auto expected_r = detail::expected_prop_arity_ec(code);
+                if(!expected_r) { return expected_r.st; }
+                auto expected = *expected_r.value;
+                if (props.size() != expected)
+                {
+                    return detail::err(std::errc::invalid_argument,
+                                       "element has wrong property count for PE code=" + std::to_string(code));
+                }
+                properties.insert(properties.end(), props.begin(), props.end());
+                comp_codes.push_back(code);
+                comp_element_ids.push_back(std::move(bind_id));  // may be empty for internal elements
+            }
+            return idx;
+        };
+
+        auto add_wire = [&](endpoint a, endpoint b) {
+            internal_wires_flat.push_back(static_cast<int>(a.element_index));
+            internal_wires_flat.push_back(a.pin);
+            internal_wires_flat.push_back(static_cast<int>(b.element_index));
+            internal_wires_flat.push_back(b.pin);
+        };
+
+        // For optional pins on "macro" elements, determine whether they are connected by scanning wires.
+        std::unordered_map<std::string, std::unordered_map<int, bool>> pl_pin_used;
+        for (auto const& w : ex.wires())
+        {
+            pl_pin_used[w.source.element_identifier][w.source.pin] = true;
+            pl_pin_used[w.target.element_identifier][w.target.pin] = true;
+        }
+
+        // Expand PL elements into PE elements (some are 1:1, some are macro expansions).
+        for (auto const& e : els)
+        {
+            auto const pl_id = e.identifier();
+            auto const model_id = e.data().value("ModelID", "");
+
+            // ---- PE primitive: 4-bit counter (Counter) ----
+            // Implemented via `PHY_ENGINE_E_DIGITAL_COUNTER4` (COUNTER4), not a hand-built macro,
+            // so behavior matches PE's digital model library.
+            // PL pins (by convention in physicsLab):
+            //   outputs: 0=o_up(MSB),1=o_upmid,2=o_lowmid,3=o_low(LSB)
+            //   inputs : 4=i_up(clock),5=i_low(enable; if unconnected, treated as enable=1)
+            if (model_id == "Counter")
+            {
+                auto ctr_r = add_pe_element(PHY_ENGINE_E_DIGITAL_COUNTER4, {0.0}, "");
+                if(!ctr_r) { return ctr_r.st; }
+                auto ctr = *ctr_r.value;
+
+                // outputs (MSB..LSB): COUNTER4 pins 0..3 are q3..q0.
+                pin_map[pl_id][0] = endpoint{ctr, 0};
+                pin_map[pl_id][1] = endpoint{ctr, 1};
+                pin_map[pl_id][2] = endpoint{ctr, 2};
+                pin_map[pl_id][3] = endpoint{ctr, 3};
+
+                // clock/en
+                pin_map[pl_id][4] = endpoint{ctr, 4};
+                pin_map[pl_id][5] = endpoint{ctr, 5};
+                continue;
+            }
+
+            // ---- Macro: 4-bit LFSR-like generator (Random Generator) ----
+            // PL pins:
+            //   outputs: 0=o_up(MSB),1=o_upmid,2=o_lowmid,3=o_low(LSB)
+            //   inputs : 4=i_up(clock),5=i_low(reset_n; active-low; if unconnected, treated as reset_n=1)
+            if (model_id == "Random Generator")
+            {
+                bool rstn_connected = pl_pin_used[pl_id][5];
+
+                // PE primitive: `PHY_ENGINE_E_DIGITAL_RANDOM_GENERATOR4` (RANDOM_GENERATOR4),
+                // so it stays compact and matches the PE digital model library.
+                auto rng_r = add_pe_element(PHY_ENGINE_E_DIGITAL_RANDOM_GENERATOR4, {1.0}, "");
+                if(!rng_r) { return rng_r.st; }
+                auto rng = *rng_r.value;
+
+                // outputs (MSB..LSB): RANDOM_GENERATOR4 pins 0..3 are q3..q0.
+                pin_map[pl_id][0] = endpoint{rng, 0};
+                pin_map[pl_id][1] = endpoint{rng, 1};
+                pin_map[pl_id][2] = endpoint{rng, 2};
+                pin_map[pl_id][3] = endpoint{rng, 3};
+
+                // clk/reset_n
+                pin_map[pl_id][4] = endpoint{rng, 4};
+                pin_map[pl_id][5] = endpoint{rng, 5};
+
+                if (!rstn_connected)
+                {
+                    auto const1_r = add_pe_element(PHY_ENGINE_E_DIGITAL_INPUT, {1.0}, "");
+                    if(!const1_r) { return const1_r.st; }
+                    auto const1 = *const1_r.value;
+                    add_wire(endpoint{const1, 0}, endpoint{rng, 5});
+                }
+                continue;
+            }
+
+            
+
+            // ---- PL macro: D Flipflop (DFF + optional ~Q inverter) ----
+            // physicsLab pin order:
+            //   outputs: 0=o_up(Q), 1=o_low(~Q)
+            //   inputs : 2=i_up(D), 3=i_low(CLK)
+            // PE DFF pins: 0=d, 1=clk, 2=q
+            if (model_id == "D Flipflop")
+            {
+                auto dff_r = add_pe_element(PHY_ENGINE_E_DIGITAL_DFF, {}, pl_id);
+                if(!dff_r) { return dff_r.st; }
+                auto dff = *dff_r.value;
+                endpoint d{dff, 0};
+                endpoint clk{dff, 1};
+                endpoint q{dff, 2};
+
+                pin_map[pl_id][2] = d;
+                pin_map[pl_id][3] = clk;
+                pin_map[pl_id][0] = q;
+
+                bool nq_used{};
+                if (auto it_used = pl_pin_used.find(pl_id); it_used != pl_pin_used.end())
+                {
+                    if (auto it = it_used->second.find(1); it != it_used->second.end() && it->second)
+                    {
+                        nq_used = true;
+                    }
+                }
+
+                if (nq_used)
+                {
+                    auto inv_r = add_pe_element(PHY_ENGINE_E_DIGITAL_NOT, {}, "");
+                    if(!inv_r) { return inv_r.st; }
+                    auto inv = *inv_r.value;
+                    // NOT pins: 0=i, 1=o
+                    add_wire(q, endpoint{inv, 0});
+                    pin_map[pl_id][1] = endpoint{inv, 1};
+                }
+
+                continue;
+            }
+
+            // ---- PL macro: Half/Full Adder/Subtractor (pin order differs from PE model pin order) ----
+            //
+            // physicsLab(Half Adder):
+            //   outputs: 0=S, 1=C
+            //   inputs : 2=B, 3=A
+            // PE(HALF_ADDER): ia(A), ib(B), s(S), c(C)
+            if (model_id == "Half Adder")
+            {
+                auto fa_r = add_pe_element(PHY_ENGINE_E_DIGITAL_HALF_ADDER, {}, pl_id);
+                if(!fa_r) { return fa_r.st; }
+                auto fa = *fa_r.value;
+                pin_map[pl_id][3] = endpoint{fa, 0};  // A -> ia
+                pin_map[pl_id][2] = endpoint{fa, 1};  // B -> ib
+                pin_map[pl_id][0] = endpoint{fa, 2};  // S -> s
+                pin_map[pl_id][1] = endpoint{fa, 3};  // C -> c
+                continue;
+            }
+
+            // physicsLab(Full Adder):
+            //   outputs: 0=S, 1=Cout
+            //   inputs : 2=B, 3=Cin, 4=A
+            // PE(FULL_ADDER): ia(A), ib(B), cin(Cin), s(S), cout(Cout)
+            if (model_id == "Full Adder")
+            {
+                auto fa_r = add_pe_element(PHY_ENGINE_E_DIGITAL_FULL_ADDER, {}, pl_id);
+                if(!fa_r) { return fa_r.st; }
+                auto fa = *fa_r.value;
+                pin_map[pl_id][4] = endpoint{fa, 0};  // A -> ia
+                pin_map[pl_id][2] = endpoint{fa, 1};  // B -> ib
+                pin_map[pl_id][3] = endpoint{fa, 2};  // Cin -> cin
+                pin_map[pl_id][0] = endpoint{fa, 3};  // S -> s
+                pin_map[pl_id][1] = endpoint{fa, 4};  // Cout -> cout
+                continue;
+            }
+
+            // physicsLab(Half Subtractor):
+            //   outputs: 0=D, 1=Bout
+            //   inputs : 2=B, 3=A
+            // PE(HALF_SUB): ia(A), ib(B), d(D), b(Bout)
+            if (model_id == "Half Subtractor")
+            {
+                auto hs_r = add_pe_element(PHY_ENGINE_E_DIGITAL_HALF_SUBTRACTOR, {}, pl_id);
+                if(!hs_r) { return hs_r.st; }
+                auto hs = *hs_r.value;
+                pin_map[pl_id][3] = endpoint{hs, 0};  // A -> ia
+                pin_map[pl_id][2] = endpoint{hs, 1};  // B -> ib
+                pin_map[pl_id][0] = endpoint{hs, 2};  // D -> d
+                pin_map[pl_id][1] = endpoint{hs, 3};  // Bout -> b
+                continue;
+            }
+
+            // physicsLab(Full Subtractor):
+            //   outputs: 0=D, 1=Bout
+            //   inputs : 2=B, 3=Bin, 4=A
+            // PE(FULL_SUB): ia(A), ib(B), bin(Bin), d(D), bout(Bout)
+            if (model_id == "Full Subtractor")
+            {
+                auto fs_r = add_pe_element(PHY_ENGINE_E_DIGITAL_FULL_SUBTRACTOR, {}, pl_id);
+                if(!fs_r) { return fs_r.st; }
+                auto fs = *fs_r.value;
+                pin_map[pl_id][4] = endpoint{fs, 0};  // A -> ia
+                pin_map[pl_id][2] = endpoint{fs, 1};  // B -> ib
+                pin_map[pl_id][3] = endpoint{fs, 2};  // Bin -> bin
+                pin_map[pl_id][0] = endpoint{fs, 3};  // D -> d
+                pin_map[pl_id][1] = endpoint{fs, 4};  // Bout -> bout
+                continue;
+            }
+// 1:1 element mapping
+            auto cp = detail::to_phy_engine_code_and_props_ec(e.data());
+            if(!cp) { return cp.st; }
+            auto idx_r = add_pe_element(cp.value->code, std::move(cp.value->props), pl_id);
+            if(!idx_r) { return idx_r.st; }
+            auto idx = *idx_r.value;
+
+            // Default: PL pin numbering matches PE pin numbering for currently mapped 1:1 elements.
+            // We only record pins that appear in wires to avoid hardcoding pin counts.
+            auto& pm = pin_map[pl_id];
+            if (auto it_used = pl_pin_used.find(pl_id); it_used != pl_pin_used.end())
+            {
+                for (auto const& [pin, used] : it_used->second)
+                {
+                    if (used)
+                    {
+                        pm[pin] = endpoint{idx, pin};
+                    }
+                }
+            }
+        }
+
+        // Translate PL wires into PE wires via the pin map.
+        std::vector<int> wires_flat;
+        wires_flat.reserve(ex.wires().size() * 4 + internal_wires_flat.size());
+        for (auto const& w : ex.wires())
+        {
+            auto it_s_el = pin_map.find(w.source.element_identifier);
+            auto it_t_el = pin_map.find(w.target.element_identifier);
+            if (it_s_el == pin_map.end() || it_t_el == pin_map.end())
+            {
+                continue;
+            }
+
+            auto it_s_pin = it_s_el->second.find(w.source.pin);
+            auto it_t_pin = it_t_el->second.find(w.target.pin);
+            if (it_s_pin == it_s_el->second.end() || it_t_pin == it_t_el->second.end())
+            {
+                return detail::err(std::errc::invalid_argument, "wire references unmapped pin");
+            }
+
+            wires_flat.push_back(static_cast<int>(it_s_pin->second.element_index));
+            wires_flat.push_back(it_s_pin->second.pin);
+            wires_flat.push_back(static_cast<int>(it_t_pin->second.element_index));
+            wires_flat.push_back(it_t_pin->second.pin);
+        }
+
+        wires_flat.insert(wires_flat.end(), internal_wires_flat.begin(), internal_wires_flat.end());
+
+        // Ensure non-null pointers for create_circuit().
+        std::vector<double> prop_buf = properties;
+        if (prop_buf.empty())
+        {
+            prop_buf.push_back(0.0);
+        }
+
+        auto* ele_ptr = element_codes.data();
+        auto* wire_ptr = wires_flat.empty() ? nullptr : wires_flat.data();
+        auto* prop_ptr = prop_buf.data();
+
+        std::size_t* vec_pos{};
+        std::size_t* chunk_pos{};
+        std::size_t comp_size{};
+        void* cptr = create_circuit(ele_ptr,
+                                    element_codes.size(),
+                                    wire_ptr,
+                                    wires_flat.size(),
+                                    prop_ptr,
+                                    &vec_pos,
+                                    &chunk_pos,
+                                    &comp_size);
+        if (cptr == nullptr)
+        {
+            return detail::err(std::errc::io_error, "create_circuit failed");
+        }
+
+        circuit_ptr_ = cptr;
+        vec_pos_ = vec_pos;
+        chunk_pos_ = chunk_pos;
+        comp_size_ = comp_size;
+        comp_element_ids_ = std::move(comp_element_ids);
+        comp_codes_ = std::move(comp_codes);
+
+        if (comp_element_ids_.size() != comp_size_ || comp_codes_.size() != comp_size_)
+        {
+            return detail::err(std::errc::invalid_argument, "internal error: component mapping size mismatch");
+        }
+        return {};
+    }
+
+private:
+    void* circuit_ptr_{};
+    std::size_t* vec_pos_{};
+    std::size_t* chunk_pos_{};
+    std::size_t comp_size_{};
+
+    std::vector<std::string> comp_element_ids_;
+    std::vector<int> comp_codes_;
+};
+
+}  // namespace phy_engine::phy_lab_wrapper::pe
