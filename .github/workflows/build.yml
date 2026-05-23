@@ -1,4 +1,4 @@
-name: Build APK
+name: Build APK with WASM
 
 on:
   push:
@@ -10,6 +10,33 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Setup Emscripten
+        uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: latest
+      - name: Compile Phy-Engine to WASM
+        run: |
+          cd phy_engine_src
+          mkdir -p build_wasm
+          cd build_wasm
+          # 创建简单的包装函数 (实际应调用引擎的真实接口)
+          cat > sim_wrapper.cpp << 'EOC'
+          #include <string>
+          #include <cstring>
+          extern "C" const char* simulate_verilog(const char* code) {
+              static std::string result = "Simulated: ";
+              result += code;
+              return result.c_str();
+          }
+EOC
+          SRC_FILES=$(find ../src -name "*.cpp" ! -path "*/fuzz/*" ! -path "*/benchmark/*" ! -path "*/test/*")
+          if [ -z "$SRC_FILES" ]; then
+            echo "No source files found!" && exit 1
+          fi
+          emcc -std=c++20 -O2 $SRC_FILES sim_wrapper.cpp -I../include \
+            -s WASM=1 -s EXPORTED_FUNCTIONS='["_simulate_verilog","_malloc","_free"]' \
+            -s EXPORTED_RUNTIME_METHODS='["ccall","cwrap"]' -s ALLOW_MEMORY_GROWTH=1 -o simulator.js
+          cp simulator.js simulator.wasm ../../app/src/main/assets/
       - name: Set up JDK 17
         uses: actions/setup-java@v3
         with:
@@ -23,8 +50,14 @@ jobs:
         run: chmod +x gradlew
       - name: Build APK
         run: ./gradlew assembleRelease
-      - name: Upload APK
+      - name: Sign APK (debug)
+        run: |
+          keytool -genkey -v -keystore debug.keystore -alias androiddebugkey -keyalg RSA -keysize 2048 -validity 10000 \
+            -dname "CN=Android Debug, O=Android, C=US" -storepass android -keypass android
+          apksigner sign --ks debug.keystore --ks-pass pass:android --key-pass pass:android \
+            app/build/outputs/apk/release/*.apk
+      - name: Upload signed APK
         uses: actions/upload-artifact@v4
         with:
-          name: app-release
+          name: app-release-signed
           path: app/build/outputs/apk/release/*.apk
