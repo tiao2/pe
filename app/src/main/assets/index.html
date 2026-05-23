@@ -1,0 +1,19 @@
+<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>Verilog Simulator</title>
+<script src="simulator.js"></script>
+<style>textarea{width:100%;height:300px;font-family:monospace}</style>
+</head><body>
+<h3>Verilog Simulator (Phy-Engine)</h3>
+<textarea id="code">module top(input a, output y); assign y = a; endmodule</textarea><br>
+<button onclick="run()">Run</button>
+<pre id="output"></pre>
+<script>
+let simulate = null;
+Module.onRuntimeInitialized = () => { simulate = Module.cwrap('simulate_verilog', 'string', ['string']); };
+function run() {
+    if(simulate) {
+        document.getElementById('output').innerText = simulate(document.getElementById('code').value);
+    } else { document.getElementById('output').innerText = 'Loading WASM...'; }
+}
+</script>
+</body></html>
