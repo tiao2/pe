@@ -1,47 +1,28 @@
-name: Build APK with WASM
+name: Build APK
 
-on: [push, workflow_dispatch]
+on:
+  push:
+    branches: [ master, main ]
+  workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Setup Emscripten
-        uses: mymindstorm/setup-emsdk@v14
+      - name: Set up JDK 17
+        uses: actions/setup-java@v3
         with:
-          version: latest
-
-      - name: Compile Phy-Engine to WASM
-        run: |
-          cd phy_engine_src
-          mkdir -p build_wasm && cd build_wasm
-          SRC_FILES=$(find ../src -name "*.cpp" ! -path "*/fuzz/*" ! -path "*/benchmark/*")
-          # 包装函数（需要根据实际引擎修改，目前为占位符）
-          cat > sim_wrapper.cpp << EOC
-          #include <string>
-          #include <cstring>
-          extern "C" const char* simulate_verilog(const char* code) {
-              static std::string result = "Simulated: ";
-              result += code;
-              return result.c_str();
-          }
-EOC
-          emcc -std=c++20 -O2 $SRC_FILES sim_wrapper.cpp -I../include \
-            -s WASM=1 -s EXPORTED_FUNCTIONS='["_simulate_verilog","_malloc","_free"]' \
-            -s EXPORTED_RUNTIME_METHODS='["ccall","cwrap"]' -s ALLOW_MEMORY_GROWTH=1 -o simulator.js
-          cp simulator.js simulator.wasm ../../app/src/main/assets/
-          cd ../..
-
+          distribution: 'temurin'
+          java-version: '17'
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
-
+        with:
+          packages: 'platforms;android-33 build-tools;30.0.3'
+      - name: Grant execute permission for gradlew
+        run: chmod +x gradlew
       - name: Build APK
-        run: |
-          chmod +x gradlew
-          ./gradlew assembleRelease
-
+        run: ./gradlew assembleRelease
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
