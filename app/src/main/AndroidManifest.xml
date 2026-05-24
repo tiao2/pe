@@ -1,6 +1,6 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="com.verilog.simulator">
-    <application android:label="@string/app_name" android:usesCleartextTraffic="true">
+    <application android:label="Verilog Simulator">
         <activity android:name=".MainActivity" android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
