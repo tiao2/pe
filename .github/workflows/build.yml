@@ -1,4 +1,4 @@
-name: Build APK with WASM (Official Script)
+name: Build APK with WASM
 
 on:
   push:
@@ -16,14 +16,28 @@ jobs:
         with:
           version: latest
 
-      - name: Compile Phy-Engine to WASM using official script
+      - name: Compile Phy-Engine to WASM
         run: |
-          cd phy_engine_src/src/targets/wasm32-emscripten
-          chmod +x build.sh
-          export OUT_DIR="$GITHUB_WORKSPACE/phy_engine_build"
-          ./build.sh
-          cp $OUT_DIR/phy_engine.js $GITHUB_WORKSPACE/app/src/main/assets/
-          cp $OUT_DIR/phy_engine.wasm $GITHUB_WORKSPACE/app/src/main/assets/
+          cd phy_engine_src
+          # 收集源文件（排除含 main 的文件）
+          SRC_FILES=$(find src -name "*.cpp" ! -path "*/fuzz/*" ! -path "*/benchmark/*" ! -path "*/test/*" \
+            ! -name "dll_main.cpp" \
+            ! -name "verilog2plsav.cpp" \
+            ! -name "verilog2penl.cpp" \
+            ! -name "x86_16_multi_module_export_plsav.cpp" \
+            ! -name "x86_16_multi_module_plsav_trace.cpp" \
+            ! -name "x86_16_multi_module.cpp")
+          # 添加包装文件
+          SRC_FILES="$SRC_FILES simulate_wrapper.cpp"
+          emcc -std=c++20 -O2 $SRC_FILES -Iinclude \
+            -fexceptions -s DISABLE_EXCEPTION_CATCHING=0 \
+            -s WASM=1 -s MODULARIZE=1 -s EXPORT_ES6=1 -s ENVIRONMENT=web \
+            -s ALLOW_MEMORY_GROWTH=1 -s FILESYSTEM=0 \
+            -s EXPORTED_RUNTIME_METHODS='["cwrap","stringToUTF8","UTF8ToString"]' \
+            -s EXPORTED_FUNCTIONS='["_malloc","_free","_simulate_verilog"]' \
+            -o simulator.js
+          mkdir -p ../app/src/main/assets
+          cp simulator.js simulator.wasm ../app/src/main/assets/
 
       - name: Set up JDK 17
         uses: actions/setup-java@v3
@@ -41,9 +55,6 @@ jobs:
 
       - name: Build APK
         run: ./gradlew assembleRelease
-
-      - name: Add build-tools to PATH for signing
-        run: echo "$ANDROID_HOME/build-tools/30.0.3" >> $GITHUB_PATH
 
       - name: Sign APK (debug)
         run: |
