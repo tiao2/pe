@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-# Only for Dockerfile
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
@@ -26,9 +25,6 @@ em++ \
   -s EXPORTED_RUNTIME_METHODS='["cwrap"]' \
   -s EXPORTED_FUNCTIONS='["_malloc","_free","_create_circuit","_create_circuit_ex","_destroy_circuit","_circuit_set_analyze_type","_circuit_set_tr","_circuit_set_ac_omega","_circuit_analyze","_circuit_digital_clk","_circuit_sample_u8","_circuit_set_model_digital"]' \
   -o "$OUT_DIR/phy_engine.js"
-
-# Patching step removed because it used a hardcoded path
-# If needed, you can manually patch later.
 
 echo "Built:"
 ls -la "$OUT_DIR/phy_engine.js" "$OUT_DIR/phy_engine.wasm"
