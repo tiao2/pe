@@ -42,6 +42,9 @@ jobs:
       - name: Build APK
         run: ./gradlew assembleRelease
 
+      - name: Add build-tools to PATH for signing
+        run: echo "$ANDROID_HOME/build-tools/30.0.3" >> $GITHUB_PATH
+
       - name: Sign APK (debug)
         run: |
           keytool -genkey -v -keystore debug.keystore -alias androiddebugkey -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug, O=Android, C=US" -storepass android -keypass android
