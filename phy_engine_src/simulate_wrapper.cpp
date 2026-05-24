@@ -2,12 +2,17 @@
 #include <sstream>
 #include <map>
 #include <cstring>
+#include "phy_engine/phy_engine.h"
+#include "phy_engine/circuits/circuit.h"
 #include "phy_engine/verilog/digital/digital.h"
 #include "phy_engine/verilog/digital/pe_synth.h"
 #include "phy_engine/netlist/operation.h"
+#include "phy_engine/model/models/digital/logical/input.h"
+#include "phy_engine/model/models/digital/logical/output.h"
 
 using namespace phy_engine;
 using namespace phy_engine::verilog::digital;
+using namespace phy_engine::model;
 
 static std::map<std::string, std::string> parse_inputs(const char* json_str) {
     std::map<std::string, std::string> inputs;
@@ -70,13 +75,13 @@ extern "C" const char* simulate_verilog(const char* verilog_code, const char* in
             port_nodes.push_back(&node);
             std::string name((const char*)p.name.data(), p.name.size());
             if (p.dir == port_dir::input) {
-                auto [m, pos] = netlist::add_model(nl, model::INPUT{});
-                m->name = ::fast_io::u8string(reinterpret_cast<const char8_t*>(name.c_str()), name.size());
+                auto [m, pos] = netlist::add_model(nl, INPUT{});
+                m->name = reinterpret_cast<const char8_t*>(name.c_str());
                 netlist::add_to_node(nl, *m, 0, node);
                 input_models[name] = m;
             } else if (p.dir == port_dir::output) {
-                auto [m, pos] = netlist::add_model(nl, model::OUTPUT{});
-                m->name = ::fast_io::u8string(reinterpret_cast<const char8_t*>(name.c_str()), name.size());
+                auto [m, pos] = netlist::add_model(nl, OUTPUT{});
+                m->name = reinterpret_cast<const char8_t*>(name.c_str());
                 netlist::add_to_node(nl, *m, 0, node);
                 output_models[name] = m;
             }
