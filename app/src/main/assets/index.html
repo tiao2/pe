@@ -1,2 +1,72 @@
-<!DOCTYPE html>
-<html><head><meta charset="UTF-8"><title>Test</title></head><body><h1>Hello, WebView works!</h1></body></html>
+ <!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>Verilog Simulator</title>
+    <style>
+        textarea { width: 100%; height: 200px; font-family: monospace; }
+        .inputs { margin: 10px 0; display: flex; flex-wrap: wrap; gap: 10px; }
+        .input-item { display: flex; align-items: center; gap: 5px; }
+        button { margin: 10px 0; }
+        pre { background: #f4f4f4; padding: 10px; }
+    </style>
+    <script>
+        var Module = {
+            onRuntimeInitialized: function() {
+                document.getElementById('status').innerText = "✅ WASM ready";
+                document.getElementById('runBtn').disabled = false;
+            }
+        };
+    </script>
+    <script src="phy_engine.js"></script>
+</head>
+<body>
+    <h2>Verilog Simulator (Phy-Engine)</h2>
+    <p id="status">⏳ Loading WASM...</p>
+    <textarea id="code" rows="8">
+module top(input a, b, output y);
+  assign y = a & b;
+endmodule
+    </textarea>
+    <div class="inputs" id="inputs"></div>
+    <button id="runBtn" disabled onclick="run()">Run Simulation</button>
+    <h3>Output:</h3>
+    <pre id="output"></pre>
+
+    <script>
+        function generateInputs() {
+            const code = document.getElementById('code').value;
+            const inputs = [...code.matchAll(/input\s+(\w+)/g)].map(m => m[1]);
+            const container = document.getElementById('inputs');
+            container.innerHTML = '';
+            inputs.forEach(name => {
+                const div = document.createElement('div');
+                div.className = 'input-item';
+                div.innerHTML = `${name}: <select id="in_${name}"><option>H</option><option>L</option><option>X</option><option>Z</option></select>`;
+                container.appendChild(div);
+            });
+        }
+        document.getElementById('code').addEventListener('input', generateInputs);
+        generateInputs();
+
+        function run() {
+            const code = document.getElementById('code').value;
+            const inputs = {};
+            document.querySelectorAll('#inputs select').forEach(select => {
+                const name = select.id.replace('in_', '');
+                inputs[name] = select.value;
+            });
+            const inputsJson = JSON.stringify(inputs);
+            const codePtr = Module._malloc(code.length + 1);
+            const inputsPtr = Module._malloc(inputsJson.length + 1);
+            Module.stringToUTF8(code, codePtr, code.length + 1);
+            Module.stringToUTF8(inputsJson, inputsPtr, inputsJson.length + 1);
+            const resultPtr = Module._simulate_verilog(codePtr, inputsPtr);
+            const result = Module.UTF8ToString(resultPtr);
+            document.getElementById('output').innerText = result;
+            Module._free(codePtr);
+            Module._free(inputsPtr);
+        }
+    </script>
+</body>
+</html>
