@@ -1,4 +1,4 @@
-name: Build APK with WASM
+name: Build APK with WASM (Custom)
 
 on:
   push:
@@ -16,10 +16,10 @@ jobs:
         with:
           version: latest
 
-      - name: Compile Phy-Engine to WASM
+      - name: Compile Phy-Engine to WASM (with simulate_verilog)
         run: |
           cd phy_engine_src
-          # 收集源文件（排除含 main 的文件）
+          # 收集核心源文件（排除含有 main 的）
           SRC_FILES=$(find src -name "*.cpp" ! -path "*/fuzz/*" ! -path "*/benchmark/*" ! -path "*/test/*" \
             ! -name "dll_main.cpp" \
             ! -name "verilog2plsav.cpp" \
@@ -55,6 +55,9 @@ jobs:
 
       - name: Build APK
         run: ./gradlew assembleRelease
+
+      - name: Add build-tools to PATH for signing
+        run: echo "$ANDROID_HOME/build-tools/30.0.3" >> $GITHUB_PATH
 
       - name: Sign APK (debug)
         run: |
