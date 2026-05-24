@@ -16,9 +16,8 @@ em++ \
   -I"$ENGINE_DIR/include" \
   "$ENGINE_DIR/src/dll_main.cpp" \
   -fno-rtti \
-  -fno-exceptions \
-  -fno-cxx-exceptions \
-  -fno-unwind-tables \
+  -fexceptions \
+  -s DISABLE_EXCEPTION_CATCHING=0 \
   -s MODULARIZE=1 \
   -s EXPORT_ES6=1 \
   -s ENVIRONMENT=web \
