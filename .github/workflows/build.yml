@@ -16,20 +16,12 @@ jobs:
         with:
           version: latest
 
-      - name: Compile Phy-Engine to WASM (with simulate_verilog)
+      - name: Compile Phy-Engine to WASM
         run: |
           cd phy_engine_src
-          # 收集核心源文件（排除含有 main 的）
-          SRC_FILES=$(find src -name "*.cpp" ! -path "*/fuzz/*" ! -path "*/benchmark/*" ! -path "*/test/*" \
-            ! -name "dll_main.cpp" \
-            ! -name "verilog2plsav.cpp" \
-            ! -name "verilog2penl.cpp" \
-            ! -name "x86_16_multi_module_export_plsav.cpp" \
-            ! -name "x86_16_multi_module_plsav_trace.cpp" \
-            ! -name "x86_16_multi_module.cpp")
-          # 添加包装文件
-          SRC_FILES="$SRC_FILES simulate_wrapper.cpp"
-          emcc -std=c++20 -O2 $SRC_FILES -Iinclude \
+          em++ -std=c++23 -O3 \
+            -Iinclude \
+            src/dll_main.cpp simulate_wrapper.cpp \
             -fexceptions -s DISABLE_EXCEPTION_CATCHING=0 \
             -s WASM=1 -s MODULARIZE=1 -s EXPORT_ES6=1 -s ENVIRONMENT=web \
             -s ALLOW_MEMORY_GROWTH=1 -s FILESYSTEM=0 \
