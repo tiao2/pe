@@ -20,12 +20,10 @@ jobs:
         run: |
           cd phy_engine_src/src/targets/wasm32-emscripten
           chmod +x build.sh
-          # 修改输出目录到 GitHub 工作空间内的可写路径
-          sed -i 's|OUT_DIR="/wasm32-emscripten-pe-release"|OUT_DIR="$GITHUB_WORKSPACE/phy_engine_build"|' build.sh
+          export OUT_DIR="$GITHUB_WORKSPACE/phy_engine_build"
           ./build.sh
-          # 复制生成的 JS 和 WASM 到 Android assets
-          cp $GITHUB_WORKSPACE/phy_engine_build/phy_engine.js $GITHUB_WORKSPACE/app/src/main/assets/
-          cp $GITHUB_WORKSPACE/phy_engine_build/phy_engine.wasm $GITHUB_WORKSPACE/app/src/main/assets/
+          cp $OUT_DIR/phy_engine.js $GITHUB_WORKSPACE/app/src/main/assets/
+          cp $OUT_DIR/phy_engine.wasm $GITHUB_WORKSPACE/app/src/main/assets/
 
       - name: Set up JDK 17
         uses: actions/setup-java@v3
