@@ -76,12 +76,12 @@ extern "C" const char* simulate_verilog(const char* verilog_code, const char* in
             std::string name((const char*)p.name.data(), p.name.size());
             if (p.dir == port_dir::input) {
                 auto [m, pos] = netlist::add_model(nl, INPUT{});
-                m->name = ::fast_io::u8string(reinterpret_cast<const char8_t*>(name.c_str()), name.size());
+                m->name = reinterpret_cast<const char8_t*>(name.c_str());
                 netlist::add_to_node(nl, *m, 0, node);
                 input_models[name] = m;
             } else if (p.dir == port_dir::output) {
                 auto [m, pos] = netlist::add_model(nl, OUTPUT{});
-                m->name = ::fast_io::u8string(reinterpret_cast<const char8_t*>(name.c_str()), name.size());
+                m->name = reinterpret_cast<const char8_t*>(name.c_str());
                 netlist::add_to_node(nl, *m, 0, node);
                 output_models[name] = m;
             }
